@@ -49,6 +49,7 @@ class Actor:
                  state_dim: int = 3, action_dim: int = 1, device: torch.device = torch.device('cpu')):
         super(Actor, self).__init__()
 
+        self.actor_nn = None
         self.hidden_size = hidden_size
         self.hidden_layers = hidden_layers
         self.actor_lr = actor_lr
@@ -110,6 +111,8 @@ class Critic:
                  hidden_layers: int, critic_lr: int, state_dim: int = 3,
                  action_dim: int = 1, device: torch.device = torch.device('cpu')):
         super(Critic, self).__init__()
+        self.critic_optimizer = None
+        self.critic_nn = None
         self.hidden_size = hidden_size
         self.hidden_layers = hidden_layers
         self.critic_lr = critic_lr
@@ -149,6 +152,8 @@ class TrainableParameter:
 class Agent:
     def __init__(self):
         # Environment variables. You don't need to change this.
+        self.critic = None
+        self.policy = None
         self.state_dim = 3  # [cos(theta), sin(theta), theta_dot]
         self.action_dim = 1  # [torque] in[-1,1]
         self.batch_size = 200
@@ -166,9 +171,8 @@ class Agent:
         # TODO: Setup off-policy agent with policy and critic classes. 
         # Feel free to instantiate any other parameters you feel you might need.
 
-
-
-        pass
+        self.policy = Actor(64, 2, 0.001, self.state_dim, self.action_dim, self.device)
+        self.critic = Critic(64, 2, 0.001, self.state_dim, self.action_dim, self.device)
 
     def get_action(self, s: np.ndarray, train: bool) -> np.ndarray:
         """
@@ -178,7 +182,8 @@ class Agent:
         :return: np.ndarray, action to apply on the environment, shape (1,)
         """
         # TODO: Implement a function that returns an action from the policy for the state s.
-        action = np.random.uniform(-1, 1, (1,))
+        #action = np.random.uniform(-1, 1, (1,))
+        action, _ = self.policy.get_action_and_log_prob(torch.tensor(s, dtype=torch.float32, device=self.device), not train)
 
         assert action.shape == (1,), 'Incorrect action shape.'
         assert isinstance(action, np.ndarray), 'Action dtype must be np.ndarray'
@@ -226,9 +231,22 @@ class Agent:
         batch = self.memory.sample(self.batch_size)
         s_batch, a_batch, r_batch, s_prime_batch = batch
 
+        s_batch = torch.Tensor(s_batch)
+        a_batch = torch.Tensor(a_batch)
+        r_batch = torch.Tensor(r_batch)
+        s_prime_batch = torch.Tensor(s_prime_batch)
+
         # TODO: Implement Critic(s) update here.
 
+        current_Q_values = self.critic(s_batch, a_batch)
+        target_Q_values = r_batch + 0.5 * self.critic(s_prime_batch, self.policy(s_prime_batch))
+        critic_loss = nn.functional.mse_loss(current_Q_values, target_Q_values.detach())
+        self.run_gradient_update_step(self.critic, critic_loss)
+
         # TODO: Implement Policy update here
+
+        policy_loss = -self.critic(s_batch, self.policy(s_batch)).mean()
+        self.run_gradient_update_step(self.policy, policy_loss)
 
 
 # This main function is provided here to enable some basic testing. 
