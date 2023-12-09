@@ -25,23 +25,25 @@ class NeuralNetwork(nn.Module):
         # TODO: Implement this function which should define a neural network 
         # with a variable number of hidden layers and hidden units.
         # Here you should define layers which your network will use.
-
-        self.input_layer = nn.ModuleList([nn.Linear(input_dim, hidden_size)])
-
+        self.input_layer = nn.Linear(input_dim, hidden_size)
         self.hidden_layers = nn.ModuleList(([nn.Linear(hidden_size, hidden_size) for _ in range(hidden_layers)]))
         self.hidden_activations = nn.ModuleList([getattr(nn, activation)() for _ in range(hidden_layers)])
-
-        self.output_layer = nn.Linear(hidden_size, output_dim)
+        self.output_layer_mean = nn.Linear(hidden_size, output_dim)
+        self.output_layer_log_std = nn.Linear(hidden_size, output_dim)
 
     def forward(self, s: torch.Tensor) -> torch.Tensor:
         # TODO: Implement the forward pass for the neural network you have defined.
-
-        s = self.input_layer(s)
+        x = self.input_layer(s)
         for layer, activation in zip(self.hidden_layers, self.hidden_activations):
-            s = activation(layer(s))
+            x = activation(layer(x))
 
-        s = self.output_layer(s)
-        return s
+        output_mean = self.output_layer_mean(x)
+        output_log_std = self.output_layer_log_std(x)
+
+        # Concatenate mean and log_std along the second dimension
+        output = torch.cat([output_mean, output_log_std], dim=1)
+
+        return output
 
 
 class Actor:
@@ -49,7 +51,6 @@ class Actor:
                  state_dim: int = 3, action_dim: int = 1, device: torch.device = torch.device('cpu')):
         super(Actor, self).__init__()
 
-        self.actor_nn = None
         self.hidden_size = hidden_size
         self.hidden_layers = hidden_layers
         self.actor_lr = actor_lr
@@ -58,6 +59,12 @@ class Actor:
         self.device = device
         self.LOG_STD_MIN = -20
         self.LOG_STD_MAX = 2
+
+        ##### new params #####
+        self.actor = None
+        self.optimizer = None
+        ######################
+
         self.setup_actor()
 
     def setup_actor(self):
@@ -66,9 +73,9 @@ class Actor:
         '''
         # TODO: Implement this function which sets up the actor network. 
         # Take a look at the NeuralNetwork class in utils.py.
-
-        self.actor_nn = NeuralNetwork(self.state_dim, self.action_dim, self.hidden_size, self.hidden_layers, 'ReLU')
-        self.actor_nn.to(self.device)
+        actor_nn = NeuralNetwork(self.state_dim, self.action_dim, self.hidden_size, self.hidden_layers, 'ReLU')
+        self.actor = actor_nn.to(self.device)
+        self.optimizer = optim.Adam(self.actor.parameters(), lr=self.actor_lr)
 
     def clamp_log_std(self, log_std: torch.Tensor) -> torch.Tensor:
         '''
@@ -89,47 +96,70 @@ class Actor:
         :param log_prob: log_probability of the the action.
         '''
         assert state.shape == (3,) or state.shape[1] == self.state_dim, 'State passed to this method has a wrong shape'
+
+        ## added by me #######
+        state = state.unsqueeze(0) if state.shape == (3,) else state
+        ######################
+
         action, log_prob = torch.zeros(state.shape[0]), torch.ones(state.shape[0])
         # TODO: Implement this function which returns an action and its log probability.
         # If working with stochastic policies, make sure that its log_std are clamped 
         # using the clamp_log_std function.
+        output = self.actor(state)
 
-        action = self.actor_nn(state)
+        if deterministic:
+            action = output[:, 0]
+            log_prob = torch.zeros(state.shape[0])
+        elif not deterministic:
+            log_std = self.clamp_log_std(output[:, 1])
+            std = torch.exp(log_std)
+            mean = output[:, 0]
+            normal = Normal(mean, std)
+            action = normal.rsample()
+            log_prob = normal.log_prob(action)
 
-        if not deterministic:
-            dist = Normal(action, torch.exp(self.clamp_log_std(action)))
-            action = dist.sample()
-            log_prob = dist.log_prob(action)
+        action = action.unsqueeze(1) if (action.shape == (state.shape[0],) and state.shape[0] != 1) else action
+        log_prob = log_prob.unsqueeze(1) if (log_prob.shape == (state.shape[0],) and state.shape[0] != 1) else log_prob
 
-        assert action.shape == (state.shape[0], self.action_dim) and \
-               log_prob.shape == (state.shape[0], self.action_dim), 'Incorrect shape for action or log_prob.'
+        action = action.clamp(-1, 1)
+
+        assert (action.shape == (self.action_dim,) and
+                log_prob.shape == (self.action_dim,)) or (action.shape == (state.shape[0], 1) and
+                                                          log_prob.shape == (
+                                                              state.shape[0],
+                                                              1)), 'Incorrect shape for action or log_prob.'
         return action, log_prob
 
-
+# changed critic_lr: int to critic_lr: float below
 class Critic:
     def __init__(self, hidden_size: int,
-                 hidden_layers: int, critic_lr: int, state_dim: int = 3,
+                 hidden_layers: int, critic_lr: float, state_dim: int = 3,
                  action_dim: int = 1, device: torch.device = torch.device('cpu')):
         super(Critic, self).__init__()
-        self.critic_optimizer = None
-        self.critic_nn = None
         self.hidden_size = hidden_size
         self.hidden_layers = hidden_layers
         self.critic_lr = critic_lr
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.device = device
+
+        ##### new params #####
+        self.critic_1 = None
+        self.critic_2 = None
+        self.optimizer = None
+        ######################
+
         self.setup_critic()
 
     def setup_critic(self):
         # TODO: Implement this function which sets up the critic(s). Take a look at the NeuralNetwork 
         # class in utils.py. Note that you can have MULTIPLE critic networks in this class.
-
-        self.critic_nn = NeuralNetwork(self.state_dim, self.action_dim, self.hidden_size, self.hidden_layers, 'ReLU')
-        self.critic_nn.to(self.device)
-
-        self.critic_optimizer = torch.optim.Adam(self.critic_nn.parameters(), lr=self.critic_lr)
-
+        self.critic_1 = NeuralNetwork(self.state_dim + self.action_dim, 1, self.hidden_size, self.hidden_layers, 'ReLU')
+        self.critic_2 = NeuralNetwork(self.state_dim + self.action_dim, 1, self.hidden_size, self.hidden_layers, 'ReLU')
+        self.critic_1 = self.critic_1.to(self.device)
+        self.critic_2 = self.critic_2.to(self.device)
+        self.optimizer = optim.Adam(list(self.critic_1.parameters()) + list(self.critic_2.parameters()),
+                                    lr=self.critic_lr)
 
 class TrainableParameter:
     '''
@@ -148,12 +178,9 @@ class TrainableParameter:
     def get_log_param(self) -> torch.Tensor:
         return self.log_param
 
-
 class Agent:
     def __init__(self):
         # Environment variables. You don't need to change this.
-        self.critic = None
-        self.policy = None
         self.state_dim = 3  # [cos(theta), sin(theta), theta_dot]
         self.action_dim = 1  # [torque] in[-1,1]
         self.batch_size = 200
@@ -165,25 +192,45 @@ class Agent:
         print("Using device: {}".format(self.device))
         self.memory = ReplayBuffer(self.min_buffer_size, self.max_buffer_size, self.device)
 
+        ##### new params #####
+        self.critic_base = None
+        self.critic_target = None
+        self.policy = None
+        self.hidden_size = 256
+        self.hidden_layers = 2
+        self.critic_lr = 0.001
+        self.discount = 0.99
+        self.tau = 0.005
+        self.temperature = TrainableParameter(0.2, 0.001, True, self.device)
+        self.target_entropy = -1 * self.action_dim
+        ######################
+
         self.setup_agent()
 
     def setup_agent(self):
         # TODO: Setup off-policy agent with policy and critic classes. 
         # Feel free to instantiate any other parameters you feel you might need.
+        self.critic_base = Critic(self.hidden_size, self.hidden_layers, self.critic_lr, self.state_dim, self.action_dim,
+                                  self.device)
+        self.critic_target = Critic(self.hidden_size, self.hidden_layers, self.critic_lr, self.state_dim,
+                                    self.action_dim, self.device)
+        self.policy = Actor(self.hidden_size, self.hidden_layers, self.critic_lr, self.state_dim, self.action_dim,
+                            self.device)
 
-        self.policy = Actor(64, 2, 0.001, self.state_dim, self.action_dim, self.device)
-        self.critic = Critic(64, 2, 0.001, self.state_dim, self.action_dim, self.device)
+        self.critic_target_update(self.critic_base.critic_1, self.critic_target.critic_1, 0.0, False)
+        self.critic_target_update(self.critic_base.critic_2, self.critic_target.critic_2, 0.0, False)
 
     def get_action(self, s: np.ndarray, train: bool) -> np.ndarray:
         """
         :param s: np.ndarray, state of the pendulum. shape (3, )
         :param train: boolean to indicate if you are in eval or train mode. 
                     You can find it useful if you want to sample from deterministic policy.
-        :return: np.ndarray, action to apply on the environment, shape (1,)
+        :return: np.ndarray,, action to apply on the environment, shape (1,)
         """
         # TODO: Implement a function that returns an action from the policy for the state s.
-        #action = np.random.uniform(-1, 1, (1,))
-        action, _ = self.policy.get_action_and_log_prob(torch.tensor(s, dtype=torch.float32, device=self.device), not train)
+        # action = np.random.uniform(-1, 1, (1,))
+        action = self.policy.get_action_and_log_prob(torch.tensor(s, dtype=torch.float32, device=self.device),
+                                                     deterministic=train)[0].detach().cpu().numpy()
 
         assert action.shape == (1,), 'Incorrect action shape.'
         assert isinstance(action, np.ndarray), 'Action dtype must be np.ndarray'
@@ -231,23 +278,34 @@ class Agent:
         batch = self.memory.sample(self.batch_size)
         s_batch, a_batch, r_batch, s_prime_batch = batch
 
-        s_batch = torch.Tensor(s_batch)
-        a_batch = torch.Tensor(a_batch)
-        r_batch = torch.Tensor(r_batch)
-        s_prime_batch = torch.Tensor(s_prime_batch)
-
         # TODO: Implement Critic(s) update here.
+        with torch.no_grad():
+            next_action, next_log_prob = self.policy.get_action_and_log_prob(s_prime_batch, True)
+            next_q1 = self.critic_target.critic_1(torch.cat((s_prime_batch, next_action), 1))[0]
+            next_q2 = self.critic_target.critic_2(torch.cat((s_prime_batch, next_action), 1))[0]
+            next_q = torch.min(next_q1, next_q2) - self.temperature.get_param() * next_log_prob
+            target_q = r_batch + self.discount * next_q
 
-        current_Q_values = self.critic(s_batch, a_batch)
-        target_Q_values = r_batch + 0.5 * self.critic(s_prime_batch, self.policy(s_prime_batch))
-        critic_loss = nn.functional.mse_loss(current_Q_values, target_Q_values.detach())
-        self.run_gradient_update_step(self.critic, critic_loss)
+        q1 = self.critic_base.critic_1(torch.cat((s_batch, a_batch), 1))[0]
+        q2 = self.critic_base.critic_2(torch.cat((s_batch, a_batch), 1))[0]
+        critic_loss = torch.nn.functional.mse_loss(q1, target_q) + torch.nn.functional.mse_loss(q2, target_q)
+        self.run_gradient_update_step(self.critic_base, critic_loss)
 
         # TODO: Implement Policy update here
-
-        policy_loss = -self.critic(s_batch, self.policy(s_batch)).mean()
+        action, log_prob = self.policy.get_action_and_log_prob(s_batch, True)
+        q1 = self.critic_base.critic_1(torch.cat((s_batch, action), 1))[0]
+        q2 = self.critic_base.critic_2(torch.cat((s_batch, action), 1))[0]
+        q = torch.min(q1, q2)
+        policy_loss = (self.temperature.get_param() * log_prob - q).mean()
         self.run_gradient_update_step(self.policy, policy_loss)
 
+        self.critic_target_update(self.critic_base.critic_1, self.critic_target.critic_1, self.tau, True)
+        self.critic_target_update(self.critic_base.critic_2, self.critic_target.critic_2, self.tau, True)
+
+        temp_loss = -(self.temperature.get_log_param() * (-log_prob + self.target_entropy).detach()).mean()
+        self.temperature.optimizer.zero_grad()
+        temp_loss.backward()
+        self.temperature.optimizer.step()
 
 # This main function is provided here to enable some basic testing. 
 # ANY changes here WON'T take any effect while grading.
@@ -258,7 +316,7 @@ if __name__ == '__main__':
 
     # You may set the save_video param to output the video of one of the evalution episodes, or 
     # you can disable console printing during training and testing by setting verbose to False.
-    save_video = False
+    save_video = True
     verbose = True
 
     agent = Agent()
